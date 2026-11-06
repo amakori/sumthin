@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
-import { ArrowRight, Heart, LockKeyhole, BadgeCheck } from 'lucide-react';
+import { ArrowRight, Heart, LockKeyhole, BadgeCheck, Send } from 'lucide-react';
 import { isSupabaseConfigured, supabase } from './lib/supabase';
+import { shareLink } from './lib/share';
 import type { Creator, Tier, Product } from './App';
 
 // ---- Inline preview data (mirrors App.tsx, no circular dep) ----
@@ -20,59 +21,75 @@ const initials = (name = 'S') =>
 
 const money = (value: number) => `ZMW ${Number(value).toFixed(0)}`;
 
-const copyToClipboard = (text: string) => {
-  navigator.clipboard.writeText(text).catch(() => {});
-};
-
-export default function CreatorSharePage({ slug }: { slug: string }) {
+export default function CreatorSharePage({ slug, productId, onOrder }: { slug: string; productId?: string | null; onOrder: (product: Product) => void }) {
   const [creator, setCreator] = useState<Creator | null>(null);
   const [tiers, setTiers] = useState<Tier[]>([]);
   const [products, setProducts] = useState<Product[]>([]);
   const [loading, setLoading] = useState(true);
-  const [copied, setCopied] = useState(false);
+  const [shareError, setShareError] = useState('');
+  const [shareNotice, setShareNotice] = useState('');
 
   useEffect(() => {
+    let active = true;
+    setLoading(true);
+    setCreator(null);
+    setTiers([]);
+    setProducts([]);
     if (!isSupabaseConfigured || !supabase) {
       // Preview mode — find matching creator by handle
       const found = previewCreators.find((c) => c.handle === slug) ?? null;
-      setCreator(found);
-      setTiers(found?.creator_tiers ?? []);
-      setProducts(found ? previewProducts.filter((p) => p.creator_id === found.id) : []);
-      setLoading(false);
-      return;
+      if (active) {
+        setCreator(found);
+        setTiers(found?.creator_tiers ?? []);
+        setProducts(found ? previewProducts.filter((p) => p.creator_id === found.id) : []);
+        setLoading(false);
+      }
+      return () => { active = false; };
     }
+    const client = supabase;
 
     const loadData = async () => {
       try {
-        const { data: creatorData, error: cErr } = await supabase!
+        const { data: creatorData, error: cErr } = await client
           .from('creator_profiles')
           .select('*')
           .eq('handle', slug)
+          .eq('is_published', true)
           .maybeSingle();
         if (cErr) throw cErr;
-        if (!creatorData) { setLoading(false); return; }
-        setCreator(creatorData as Creator);
+        if (!creatorData) return;
 
         const [tierRes, productRes] = await Promise.all([
-          supabase!.from('creator_tiers').select('*').eq('creator_id', creatorData.id),
-          supabase!.from('creator_products').select('*').eq('creator_id', creatorData.id),
+          client.from('creator_tiers').select('*').eq('creator_id', creatorData.id).eq('active', true),
+          client.from('creator_products').select('*').eq('creator_id', creatorData.id).eq('active', true).order('created_at', { ascending: false }),
         ]);
+        if (tierRes.error) throw tierRes.error;
+        if (productRes.error) throw productRes.error;
+        if (!active) return;
+        setCreator(creatorData as Creator);
         setTiers((tierRes.data ?? []) as Tier[]);
         setProducts((productRes.data ?? []) as Product[]);
       } catch (e) {
-        console.error('CreatorSharePage load error', e);
+        if (active) setShareError(e instanceof Error ? e.message : 'Could not load this creator page.');
       } finally {
-        setLoading(false);
+        if (active) setLoading(false);
       }
     };
 
-    loadData();
+    void loadData();
+    return () => { active = false; };
   }, [slug]);
 
-  const handleCopy = () => {
-    copyToClipboard(window.location.href);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+  const share = async (title: string, text: string, url: string) => {
+    setShareError('');
+    setShareNotice('');
+    try {
+      const result = await shareLink(title, text, url);
+      if (result === 'shared') setShareNotice('Share link opened.');
+      if (result === 'copied') setShareNotice('Share link copied.');
+    } catch (error) {
+      setShareError(error instanceof Error ? error.message : 'Could not share this link.');
+    }
   };
 
   if (loading) {
@@ -87,8 +104,8 @@ export default function CreatorSharePage({ slug }: { slug: string }) {
   if (!creator) {
     return (
       <div className="page-wrap" style={{ textAlign: 'center', paddingTop: '4rem' }}>
-        <h2>Creator not found.</h2>
-        <p style={{ color: 'var(--color-muted)' }}>The link may be wrong or the creator hasn't published yet.</p>
+        <h2>{shareError ? 'Could not load this creator page.' : 'Creator not found.'}</h2>
+        <p style={{ color: 'var(--muted)' }}>{shareError || 'The link may be wrong or the creator has not published yet.'}</p>
         <a href="/" className="button button-dark" style={{ display: 'inline-flex', marginTop: '1.5rem', gap: '6px' }}>
           Go to sumthin <ArrowRight size={15} />
         </a>
@@ -96,7 +113,8 @@ export default function CreatorSharePage({ slug }: { slug: string }) {
     );
   }
 
-  const shareUrl = `${window.location.origin}${window.location.pathname}#c/${slug}`;
+  const shareUrl = `${window.location.origin}${window.location.pathname}#c/${encodeURIComponent(slug)}`;
+  const selectedProduct = productId ? products.find((product) => product.id === productId) : null;
 
   return (
     <div className="page-wrap creator-page">
@@ -111,12 +129,13 @@ export default function CreatorSharePage({ slug }: { slug: string }) {
           <p>{creator.bio}</p>
         </div>
         <div className="creator-profile-actions">
-          <button className="button button-dark" onClick={handleCopy}>
-            {copied ? '✓ Link copied!' : '🔗 Share this page'}
+          <button className="button button-dark" onClick={() => void share(`${creator.display_name} on Sumthin`, `Discover ${creator.display_name} on Sumthin.`, shareUrl)}>
+            <Send size={14} /> Share this page
           </button>
           <span><LockKeyhole size={13} /> MFI-reviewed monthly support</span>
         </div>
       </div>
+      {(shareError || shareNotice) && <div className={shareError ? 'error-banner' : 'shop-notice'} role={shareError ? 'alert' : 'status'}>{shareError || shareNotice}</div>}
 
       <div className="creator-detail-grid">
         {/* Tiers / Support section */}
@@ -144,24 +163,23 @@ export default function CreatorSharePage({ slug }: { slug: string }) {
             <div className="section-heading compact">
               <div>
                 <div className="eyebrow">FROM THE SHOP</div>
-                <h2>Things you can take home.</h2>
+                <h2>{selectedProduct ? selectedProduct.name : 'Things you can take home.'}</h2>
               </div>
             </div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
-              {products.map((product) => (
-                <div key={product.id} className="tier-card" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '1rem' }}>
-                  <div>
-                    <strong>{product.name}</strong>
-                    <p style={{ margin: '4px 0 0' }}>{product.description}</p>
+            {productId && !selectedProduct && <div className="form-message" role="status">That product is no longer available. Browse the creator’s current shop below.</div>}
+            <div className="creator-products-grid">
+              {(selectedProduct ? [selectedProduct, ...products.filter((product) => product.id !== selectedProduct.id)] : products).map((product) => {
+                const productUrl = `${window.location.origin}${window.location.pathname}#c/${encodeURIComponent(slug)}/p/${encodeURIComponent(product.id)}`;
+                return <article key={product.id} id={productId === product.id ? 'shared-product' : undefined} className={`product-card creator-product-card ${productId === product.id ? 'shared-product-card' : ''}`}>
+                  <div className="product-image product-tone-0">{product.image_url ? <img src={product.image_url} alt={product.name} /> : <><Heart size={32} strokeWidth={1.2} /><span>{product.name}</span></>}</div>
+                  <div className="product-details"><div><h3>{product.name}</h3><span>{creator.display_name}</span></div><strong>{money(Number(product.price))}</strong></div>
+                  <p className="product-description">{product.description}</p>
+                  <div className="product-card-actions">
+                    <button className="button button-dark" onClick={() => onOrder(product)}>Buy <ArrowRight size={13} /></button>
+                    <button className="button button-share" onClick={() => void share(product.name, `${product.name} by ${creator.display_name} on Sumthin.`, productUrl)} aria-label={`Share ${product.name}`}><Send size={13} /> Share</button>
                   </div>
-                  <div style={{ textAlign: 'right', flexShrink: 0 }}>
-                    <div className="tier-price" style={{ fontSize: '1rem' }}>{money(Number(product.price))}</div>
-                    <a href="/#pay" className="button button-dark" style={{ display: 'inline-flex', gap: '6px', textDecoration: 'none', marginTop: '6px', padding: '6px 12px', fontSize: '13px' }}>
-                      Buy <ArrowRight size={13} />
-                    </a>
-                  </div>
-                </div>
-              ))}
+                </article>;
+              })}
             </div>
           </section>
         )}
@@ -174,8 +192,8 @@ export default function CreatorSharePage({ slug }: { slug: string }) {
           <strong>Share this page.</strong>
           <p style={{ wordBreak: 'break-all', fontSize: '13px', color: 'var(--color-muted)', marginTop: '4px' }}>{shareUrl}</p>
         </div>
-        <button className="button button-dark" onClick={handleCopy} style={{ flexShrink: 0 }}>
-          {copied ? '✓ Copied' : 'Copy link'}
+        <button className="button button-dark" onClick={() => void share(`${creator.display_name} on Sumthin`, `Discover ${creator.display_name} on Sumthin.`, shareUrl)} style={{ flexShrink: 0 }}>
+          <Send size={14} /> Share profile
         </button>
       </div>
     </div>

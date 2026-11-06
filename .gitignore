@@ -5,3 +5,5 @@ coverage/
 .env.*
 !.env.example
 *.local
+.wrangler/
+worker/.dev.vars*
